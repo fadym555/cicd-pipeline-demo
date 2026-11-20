@@ -11,12 +11,20 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: gitleaks
+        run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest dir /repo --redact -v
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -26,11 +34,16 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff==0.8.4
-      - run: ruff check .
+      - name: Lint Python
+        run: ruff check .
+      - name: Lint Dockerfile
+        run: docker run --rm -i hadolint/hadolint:latest < Dockerfile
+      - uses: azure/setup-helm@v5
+      - name: Lint Helm chart
+        run: helm lint deploy/chart
 
   test:
     name: Test (py${{ matrix.python }})
-    needs: lint
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,11 +57,35 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
-      - run: pytest -v
+      - name: Run tests with coverage gate
+        run: pytest -v --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-py${{ matrix.python }}
+          path: coverage.xml
+
+  sast:
+    name: Vulnerability & misconfig scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Trivy filesystem scan
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs \
+            --scanners vuln,misconfig,secret --format sarif \
+            --output /src/trivy-fs.sarif /src
+      - name: Upload results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
 
   build:
-    name: Build & scan image
-    needs: test
+    name: Build, scan & SBOM
+    needs: [secret-scan, lint, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -75,15 +112,26 @@ jobs:
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --severity CRITICAL --ignore-unfixed \
             --exit-code 1 --no-progress app:${{ github.sha }}
+      - name: Generate SBOM
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" \
+            anchore/syft:latest app:${{ github.sha }} -o spdx-json=/out/sbom.spdx.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: sbom.spdx.json
 
   publish:
-    name: Publish to GHCR
-    needs: build
+    name: Publish & sign image
+    needs: [build, sast]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -99,10 +147,77 @@ jobs:
           tags: |
             type=sha
             type=raw,value=latest
-      - uses: docker/build-push-action@v7
+      - id: push
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+      - uses: sigstore/cosign-installer@v4
+      - name: Sign image (keyless, GitHub OIDC)
+        run: cosign sign --yes ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - name: Create Kubernetes cluster (kind)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: staging
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load published image into the cluster
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}@${{ needs.publish.outputs.digest }}"
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" app:staging
+          kind load docker-image app:staging --name staging
+      - name: Helm upgrade --install
+        run: |
+          helm upgrade --install demo deploy/chart \
+            --set image.repository=app --set image.tag=staging --set image.pullPolicy=Never \
+            --set appVersion=${{ github.sha }} --wait --timeout 3m
+      - name: Helm test
+        run: helm test demo --logs
+      - name: Show rollout
+        run: kubectl get deploy,pods,svc -o wide
+
+  release:
+    name: Release to production
+    needs: [publish, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v4
+      - name: Verify image signature
+        run: |
+          cosign verify ${{ env.IMAGE_NAME }}@${{ needs.publish.outputs.digest }} \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+      - uses: docker/setup-buildx-action@v4
+      - name: Promote verified image to stable
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:stable \
+            ${{ env.IMAGE_NAME }}@${{ needs.publish.outputs.digest }}
