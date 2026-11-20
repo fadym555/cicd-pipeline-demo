@@ -2,24 +2,36 @@
 
 [![CI/CD](https://github.com/fadym555/cicd-pipeline-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/fadym555/cicd-pipeline-demo/actions/workflows/ci.yml)
 
-A small FastAPI service I use to show how I set up CI/CD for client projects. The app itself is tiny on purpose. The interesting part is the pipeline.
+A small FastAPI service with the kind of delivery pipeline I set up for clients. The app is tiny on purpose. The pipeline is the point: every change is linted, tested, scanned, built into a signed image, deployed to a real Kubernetes cluster and only promoted to production after a human approves it.
 
-## What happens on every push
+## Pipeline
 
 | Stage | What it does |
 |---|---|
-| **Lint** | `ruff check` so style problems never reach review |
-| **Test** | `pytest` on Python 3.11 and 3.12 in parallel, with pip caching |
-| **Build & scan** | Builds the Docker image with layer caching, starts the container and hits `/healthz`, then runs Trivy and fails on critical CVEs |
-| **Publish** | On `main` only, pushes the image to GHCR tagged with the commit SHA and `latest` |
+| **Secret scan** | gitleaks over the whole repo, so credentials never land in git |
+| **Lint** | ruff for Python, hadolint for the Dockerfile, `helm lint` for the chart |
+| **Test** | pytest on Python 3.11 and 3.12 in parallel, fails under 90% coverage, coverage reports kept as artifacts |
+| **Vulnerability & misconfig scan** | Trivy over dependencies, Dockerfile and chart. Results go to the repo's Security tab |
+| **Build, scan & SBOM** | Builds the image with layer caching, smoke-tests the container, fails on critical CVEs, publishes an SPDX SBOM |
+| **Publish & sign** | Pushes to GHCR and signs the image with cosign (keyless, GitHub OIDC). No signing keys to manage |
+| **Deploy to staging** | Spins up a Kubernetes cluster, deploys the signed image with Helm and runs `helm test` |
+| **Release to production** | Waits for a reviewer to approve, verifies the signature, then promotes the image to `stable` |
 
-Pull requests run everything except publishing. A newer push cancels an older run on the same branch, so runners aren't wasted.
+Pull requests run everything up to the build. Only `main` publishes and deploys.
+
+## Verify an image yourself
+
+```bash
+cosign verify ghcr.io/fadym555/cicd-pipeline-demo:stable \
+  --certificate-identity-regexp '^https://github.com/fadym555/cicd-pipeline-demo/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ## Run it locally
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -v
+pytest -v --cov=app
 uvicorn app.main:app --reload
 ```
 
@@ -31,17 +43,6 @@ docker run -p 8000:8000 cicd-pipeline-demo
 curl localhost:8000/healthz
 ```
 
-Or pull the published image:
-
-```bash
-docker pull ghcr.io/fadym555/cicd-pipeline-demo:latest
-```
-
-## Endpoints
-
-- `GET /healthz` returns `{"status": "ok"}`
-- `GET /version` returns the `APP_VERSION` env var (defaults to `dev`)
-
 ## Adapting it
 
-The same structure works for Node, Go or Java. Swap the lint and test steps and keep the build, scan and publish stages. Deploying to Kubernetes, ECS or a VM is one more job after `publish`.
+The same structure works for Node, Go, Java or .NET. Swap the lint and test steps and keep the rest. Staging can point at any cluster (AKS, EKS, GKE) by replacing the kind step with your cluster credentials.
