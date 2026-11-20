@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cicd-pipeline-demo
+description: Helm chart for the cicd-pipeline-demo API
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
